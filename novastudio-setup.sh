@@ -381,19 +381,40 @@ EOF
 
     # ── Kernel selection ─────────────────────────────────────────────────────
     task "Installing low-latency / realtime kernel"
-    # Use copr for realtime kernel
-    dnf copr enable -y mbarnes/rtl8192eu >> "$LOG_FILE" 2>&1 || true
-    if dnf list available | grep -q "kernel-rt" 2>/dev/null; then
-        spinner_run "Installing kernel-rt (realtime)" dnf install -y kernel-rt kernel-rt-devel
-        # Set realtime kernel as default
-        local rt_ver
-        rt_ver=$(rpm -q kernel-rt --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort -V | tail -1)
-        if [[ -n "$rt_ver" ]]; then
-            grubby --set-default "/boot/vmlinuz-${rt_ver}" >> "$LOG_FILE" 2>&1 || true
-            success "Realtime kernel $rt_ver set as default"
+    # kernel-rt is in RPM Fusion Non-Free. On brand-new Fedora releases it may
+    # lag by a few weeks. If not found, we try the official @rt/realtime COPR
+    # as a fallback before giving up and staying on the standard kernel.
+    local rt_found=false
+
+    if dnf list available kernel-rt >> "$LOG_FILE" 2>&1; then
+        rt_found=true
+    else
+        info "kernel-rt not in RPM Fusion yet for this Fedora release — trying @rt/realtime COPR"
+        if dnf copr enable -y @rt/realtime >> "$LOG_FILE" 2>&1; then
+            # Refresh metadata after enabling new repo
+            dnf makecache >> "$LOG_FILE" 2>&1 || true
+            if dnf list available kernel-rt >> "$LOG_FILE" 2>&1; then
+                rt_found=true
+            fi
+        else
+            warn "Could not enable @rt/realtime COPR"
+        fi
+    fi
+
+    if $rt_found; then
+        spinner_run "Installing kernel-rt (realtime)" \
+            dnf install -y kernel-rt kernel-rt-devel kernel-rt-modules-extra
+        # Set realtime kernel as default using grubby (most reliable method)
+        local rt_vmlinuz
+        rt_vmlinuz=$(ls /boot/vmlinuz-*rt* 2>/dev/null | sort -V | tail -1)
+        if [[ -n "$rt_vmlinuz" ]]; then
+            grubby --set-default "$rt_vmlinuz" >> "$LOG_FILE" 2>&1 && \
+                success "Realtime kernel set as default: $rt_vmlinuz" || \
+                warn "grubby could not set default kernel — set manually after reboot"
         fi
     else
-        warn "kernel-rt not available — installing kernel-lts as fallback"
+        warn "kernel-rt not available in any known repo for Fedora $(rpm -E %fedora)"
+        warn "Staying on standard kernel. Retry later: sudo dnf install -y kernel-rt kernel-rt-devel"
         dnf_install kernel kernel-devel
     fi
 
@@ -493,12 +514,14 @@ EOF
     [[ "$HW_CPU_VENDOR" == "AuthenticAMD" ]] && grub_opts+=" processor.max_cstate=1"
 
     sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"${grub_opts}\"|" /etc/default/grub
-    if [[ -f /boot/efi/EFI/fedora/grub.cfg ]]; then
-        grub2-mkconfig -o /boot/efi/EFI/fedora/grub.cfg >> "$LOG_FILE" 2>&1
+    # On modern Fedora (EFI or BIOS), grub2-mkconfig must always target
+    # /boot/grub2/grub.cfg — the EFI path is a read-only BLS wrapper.
+    # grub2-mkconfig itself writes the correct EFI location internally.
+    if grub2-mkconfig -o /boot/grub2/grub.cfg >> "$LOG_FILE" 2>&1; then
+        success "GRUB tuned with realtime parameters"
     else
-        grub2-mkconfig -o /boot/grub2/grub.cfg >> "$LOG_FILE" 2>&1
+        warn "grub2-mkconfig reported an error — check log. Boot parameters may not have applied."
     fi
-    success "GRUB tuned with realtime parameters"
 
     # ── Limits for audio ─────────────────────────────────────────────────────
     task "Setting system limits for audio production (ulimits)"
@@ -573,8 +596,17 @@ options amdgpu cik_support=1
 options amdgpu ppfeaturemask=0xffffffff
 EOF
         # ROCm for compute (media encoding)
+        # Note: mesa-opencl-icd was renamed to mesa-opencl in Fedora 38+
         if confirm "Install AMD ROCm (GPU compute — useful for video encoding)?" "y"; then
-            spinner_run "Installing ROCm" dnf install -y rocm-opencl mesa-opencl-icd
+            # Try modern package name first, fall back gracefully — non-fatal
+            if dnf list available mesa-opencl >> "$LOG_FILE" 2>&1; then
+                dnf_install rocm-opencl mesa-opencl
+            elif dnf list available mesa-opencl-icd >> "$LOG_FILE" 2>&1; then
+                dnf_install rocm-opencl mesa-opencl-icd
+            else
+                dnf_install rocm-opencl
+                warn "mesa-opencl package not found — ROCm installed without OpenCL ICD"
+            fi
         fi
         success "AMD GPU configured"
     fi
@@ -610,18 +642,26 @@ setup_audio() {
     fi
 
     # ── PipeWire stack ────────────────────────────────────────────────────────
+    # Uses dnf_install (per-package, non-fatal) rather than spinner_run so that
+    # renamed or missing packages on newer Fedora releases don't abort the whole
+    # section. Package names confirmed against Fedora 43 repos.
     task "Installing PipeWire (modern audio server)"
-    spinner_run "Installing PipeWire core" \
-        dnf install -y pipewire pipewire-devel pipewire-doc \
-            pipewire-utils pipewire-alsa pipewire-jack-audio-connection-kit \
-            pipewire-pulseaudio wireplumber wireplumber-devel \
-            gstreamer1-plugin-pipewire
+    # Core PipeWire — always present on Fedora 38+
+    dnf_install pipewire pipewire-utils pipewire-alsa \
+        pipewire-jack-audio-connection-kit pipewire-pulseaudio \
+        wireplumber
+    # Optional dev/doc packages — may not exist on all releases; failures are harmless
+    dnf_install pipewire-devel wireplumber-devel pipewire-doc 2>/dev/null || true
+    # GStreamer PipeWire integration — package was merged into gstreamer1-plugins-good
+    # on Fedora 40+; try both names, neither is fatal if absent
+    dnf_install gstreamer1-plugin-pipewire 2>/dev/null || \
+        dnf_install gstreamer1-plugins-good 2>/dev/null || true
+    success "PipeWire stack installed"
 
-    # ── JACK tools ───────────────────────────────────────────────────────────
-    task "Installing JACK2 and tools"
-    dnf_install jack-audio-connection-kit jack-audio-connection-kit-devel \
-        qjackctl carla cadence
-    success "JACK2 + QJackCtl + Carla installed"
+    # ── JACK libraries (infrastructure — no GUI apps) ────────────────────────
+    task "Installing JACK2 libraries"
+    dnf_install jack-audio-connection-kit jack-audio-connection-kit-devel
+    success "JACK2 libraries installed"
 
     # ── PipeWire JACK config for low latency ─────────────────────────────────
     task "Configuring PipeWire for low-latency (32 frames / 48000 Hz)"
@@ -687,14 +727,9 @@ SUBSYSTEM=="thunderbolt", ATTR{vendor}=="0x1235", GROUP="audio", MODE="0664"
 SUBSYSTEM=="usb", ATTR{idVendor}=="1235", ATTR{power/autosuspend}="-1"
 EOF
 
-    # Install scarlett-mixer (GUI for Scarlett controls)
-    if ! command -v scarlett-mixer &>/dev/null; then
-        if ! pip3 install scarlett-mixer >> "$LOG_FILE" 2>&1; then
-            # Fallback: install alsamixer + some UI
-            dnf_install alsa-utils
-            info "scarlett-mixer not available via pip; alsamixer installed as fallback"
-        fi
-    fi
+    # ALSA utilities (infrastructure — alsa-scarlett-gui installed in apps section)
+    dnf_install alsa-utils alsa-tools alsa-plugins-pulseaudio
+    info "Note: alsa-scarlett-gui GUI app installed in Section 12 (Applications)"
 
     # ALSA UCM profiles
     if $HW_FOCUSRITE; then
@@ -724,25 +759,11 @@ EOF
         success "User $real_user added to audio/jackuser/realtime groups"
     fi
 
-    # ── DAW & Music apps ──────────────────────────────────────────────────────
-    task "Installing audio production tools"
-    # Ardour (free DAW) — from Flathub (latest stable)
-    spinner_run "Installing Ardour (DAW)" \
-        flatpak install -y flathub org.ardour.Ardour || true
-
-    # LADSPA / LV2 / VST plugins
+    # ── Plugin framework libraries (infrastructure — not apps) ───────────────
+    task "Installing audio plugin framework libraries (LV2, LADSPA, MIDI bridge)"
     dnf_install ladspa ladspa-devel lv2 lv2-devel lilv \
-        zita-njbridge zita-alsa-pcmi \
-        a2jmidid qsynth fluidsynth
-
-    # Audacity for quick editing
-    spinner_run "Installing Audacity" \
-        flatpak install -y flathub org.audacityteam.Audacity || true
-
-    # Calf Studio plugins
-    dnf_install calf-ladspa || true
-
-    success "${ICO_MUSIC} Audio production tools installed"
+        zita-njbridge zita-alsa-pcmi a2jmidid
+    success "${ICO_MUSIC} Audio infrastructure libraries installed"
 
     # ── Enable PipeWire user services ─────────────────────────────────────────
     task "Enabling PipeWire services"
@@ -756,58 +777,35 @@ EOF
 # ──────────────────────────────────────────────────────────────────────────────
 
 setup_media_production() {
-    step_header "5" "${ICO_FILM} Media Production Tools"
+    step_header "5" "${ICO_FILM} Media Codecs & Libraries"
 
     # ── Codecs ────────────────────────────────────────────────────────────────
     task "Installing multimedia codecs (all formats)"
-    spinner_run "Codec stack" \
-        dnf install -y gstreamer1-plugins-{bad-free,bad-free-extras,good,good-extras,ugly} \
-            gstreamer1-plugin-libav ffmpeg-free \
-            libavcodec-free libavformat-free \
-            x264 x265 libvpx
-
+    # Core GStreamer plugin sets — use dnf_install so a missing plugin doesn't abort
+    dnf_install gstreamer1-plugins-bad-free gstreamer1-plugins-bad-free-extras \
+        gstreamer1-plugins-good gstreamer1-plugins-good-extras \
+        gstreamer1-plugins-ugly
+    # libav / ffmpeg bridge
+    dnf_install gstreamer1-plugin-libav
+    # ffmpeg-free (RPM Fusion Free) — provides libavcodec/libavformat as subpackages
+    dnf_install ffmpeg-free
+    # Try standalone av libs (exist on some Fedora releases, merged into ffmpeg-free on others)
+    dnf_install libavcodec-free libavformat-free 2>/dev/null || true
+    # Video codecs
+    dnf_install x264 x265 libvpx
     # OpenH264
-    dnf_install openh264 gstreamer1-plugin-openh264 mozilla-openh264 || true
+    dnf_install openh264 gstreamer1-plugin-openh264 mozilla-openh264
     success "Codecs installed"
 
-    # ── Video editors ─────────────────────────────────────────────────────────
-    task "Installing video editing applications"
-
-    # Kdenlive — powerful free NLE
-    spinner_run "Installing Kdenlive" \
-        flatpak install -y flathub org.kde.kdenlive || true
-
-    # DaVinci Resolve — we can only provide the helper; user must download
-    echo
-    echo -e "  ${YELLOW}${ICO_WARN}  DaVinci Resolve requires manual download from Blackmagic Design.${RESET}"
-    echo -e "  ${GREY}     Visit: https://www.blackmagicdesign.com/products/davinciresolve${RESET}"
-    echo -e "  ${GREY}     After download, run: sudo bash DaVinci_Resolve_*.run${RESET}"
-    # Install DaVinci dependencies
+    # ── DaVinci Resolve runtime dependencies (pre-installed, user downloads app)
+    task "Installing DaVinci Resolve runtime dependencies"
     dnf_install libxcrypt-compat libGLU fuse fuse-libs
-
-    # OBS Studio (video streaming/recording)
-    spinner_run "Installing OBS Studio" \
-        flatpak install -y flathub com.obsproject.Studio || true
-
-    # ── Photo / image editors ─────────────────────────────────────────────────
-    task "Installing image editing tools"
-    spinner_run "Installing GIMP" \
-        flatpak install -y flathub org.gimp.GIMP || true
-    spinner_run "Installing Krita" \
-        flatpak install -y flathub org.kde.krita || true
-    spinner_run "Installing Inkscape" \
-        flatpak install -y flathub org.inkscape.Inkscape || true
-    spinner_run "Installing RawTherapee" \
-        flatpak install -y flathub com.rawtherapee.RawTherapee || true
-
-    # ── 3D / VFX ─────────────────────────────────────────────────────────────
-    task "Installing 3D and VFX tools"
-    spinner_run "Installing Blender" \
-        flatpak install -y flathub org.blender.Blender || true
-
-    # ── Screen recording ─────────────────────────────────────────────────────
-    dnf_install simplescreenrecorder || \
-        flatpak install -y flathub io.github.io.github.nicehash.NiceHashQuickMiner 2>/dev/null || true
+    echo
+    echo -e "  ${CYAN}${ICO_INFO}  DaVinci Resolve dependency note:${RESET}"
+    echo -e "  ${GREY}     Runtime libs installed. To use DaVinci Resolve, download the${RESET}"
+    echo -e "  ${GREY}     installer from: https://www.blackmagicdesign.com/products/davinciresolve${RESET}"
+    echo -e "  ${GREY}     Then run: sudo bash DaVinci_Resolve_*.run${RESET}"
+    success "DaVinci Resolve runtime dependencies ready"
 
     # ── Font stack ────────────────────────────────────────────────────────────
     task "Installing professional font collection"
@@ -815,7 +813,7 @@ setup_media_production() {
         liberation-fonts fira-code-fonts ibm-plex-fonts-all \
         adobe-source-code-pro-fonts adobe-source-sans-pro-fonts \
         abattis-cantarell-fonts
-    success "${ICO_FILM} Media production tools installed"
+    success "${ICO_FILM} Media codecs and libraries installed"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -831,11 +829,18 @@ setup_windows_compatibility() {
     success "32-bit libraries available"
 
     # ── Wine Staging ──────────────────────────────────────────────────────────
-    task "Installing Wine Staging (best for audio plugins)"
-    spinner_run "Installing Wine Staging + deps" \
-        dnf install -y wine wine-staging wine-devel \
-            winetricks wine-gecko wine-mono \
-            cabextract wget curl p7zip
+    task "Installing Wine (Staging preferred, standard fallback)"
+    # wine-staging may not be packaged for every Fedora release.
+    # Try staging first; if unavailable fall back to standard wine — non-fatal.
+    if dnf list available wine-staging >> "$LOG_FILE" 2>&1; then
+        dnf_install wine-staging wine-staging-devel
+        success "Wine Staging installed"
+    else
+        dnf_install wine
+        warn "wine-staging not available for this Fedora release — standard Wine installed"
+        info "For Wine Staging features, see: https://wiki.winehq.org/Wine-Staging"
+    fi
+    dnf_install winetricks wine-gecko wine-mono cabextract wget curl p7zip
 
     # ── Wine prefix initialisation ────────────────────────────────────────────
     task "Creating NovаStudio Wine prefix"
@@ -852,11 +857,6 @@ setup_windows_compatibility() {
             corefonts dxvk vkd3d >> "$LOG_FILE" 2>&1 || true
         success "Wine runtime components installed"
     fi
-
-    # ── Proton GE (for Steam games / compatibility) ───────────────────────────
-    task "Installing ProtonUp-Qt (manage Proton-GE)"
-    flatpak install -y flathub net.davidotek.pupgui2 >> "$LOG_FILE" 2>&1 || true
-    success "ProtonUp-Qt installed"
 
     # ── DXVK ─────────────────────────────────────────────────────────────────
     task "Installing DXVK (DirectX → Vulkan translation)"
@@ -912,9 +912,6 @@ setup_windows_compatibility() {
         success "Yabridgectl VST directories configured"
     fi
 
-    # ── Bottles (GUI for Wine prefix management) ─────────────────────────────
-    task "Installing Bottles (Wine GUI frontend)"
-    flatpak install -y flathub com.usebottles.bottles >> "$LOG_FILE" 2>&1 || true
     success "${ICO_WIN} Windows compatibility stack complete"
 }
 
@@ -1338,29 +1335,6 @@ STEAMEOF
     fi
     success "Steam installed with Proton-for-all pre-seeded"
 
-    # ── Proton-GE (ProtonUp-Qt already installed in wine section; add CLI too)
-    task "Installing ProtonPlus (Proton-GE / Wine-GE manager)"
-    flatpak install -y flathub com.vysp3r.ProtonPlus >> "$LOG_FILE" 2>&1 || \
-    flatpak install -y flathub net.davidotek.pupgui2 >> "$LOG_FILE" 2>&1 || true
-    success "Proton-GE manager installed"
-
-    # ── Lutris ────────────────────────────────────────────────────────────────
-    task "Installing Lutris (universal game manager)"
-    if ! rpm -q lutris &>/dev/null; then
-        spinner_run "Installing Lutris" dnf install -y lutris
-    else
-        success "Lutris already installed"
-    fi
-    # Lutris dependencies
-    dnf_install gamemode python3-evdev python3-gobject cabextract \
-        fluid-soundfont-gm timidity++ || true
-    success "Lutris installed"
-
-    # ── Heroic Games Launcher (Epic + GOG + Amazon) ───────────────────────────
-    task "Installing Heroic Games Launcher (Epic / GOG / Amazon Games)"
-    flatpak install -y flathub com.heroicgameslauncher.hgl >> "$LOG_FILE" 2>&1 || true
-    success "Heroic Launcher installed"
-
     # ── GameMode (Feral Interactive) ──────────────────────────────────────────
     task "Installing & configuring GameMode"
     dnf_install gamemode gamemode-devel
@@ -1524,23 +1498,6 @@ EOF
     echo "hid_playstation" > /etc/modules-load.d/hid-playstation.conf
     success "PlayStation controller udev rules configured"
 
-    # Antimicrox for controller key mapping
-    flatpak install -y flathub io.github.antimicrox.antimicrox >> "$LOG_FILE" 2>&1 || true
-    success "AntiMicroX (controller mapper) installed"
-
-    # ── Emulation (RetroArch + standalone cores) ──────────────────────────────
-    task "Installing RetroArch (multi-system emulator)"
-    flatpak install -y flathub org.libretro.RetroArch >> "$LOG_FILE" 2>&1 || true
-
-    task "Installing standalone emulators"
-    flatpak install -y flathub \
-        org.DolphinEmu.dolphin-emu \
-        net.rpcs3.RPCS3 \
-        app.xemu.xemu \
-        org.ppsspp.PPSSPP \
-        io.mgba.mGBA >> "$LOG_FILE" 2>&1 || true
-    success "Emulators: RetroArch, Dolphin, RPCS3, xemu, PPSSPP, mGBA"
-
     # ── GPU-specific gaming optimisations ────────────────────────────────────
     task "Applying GPU gaming optimisations"
 
@@ -1651,11 +1608,17 @@ EOF
     fi
     success "Bottles ready (use 'Gaming' preset for Windows games)"
 
-    # ── nscd / resolv caching (reduces DNS latency in online games) ──────────
-    task "Enabling nscd DNS caching (lower ping jitter)"
-    dnf_install nscd
-    systemctl enable --now nscd >> "$LOG_FILE" 2>&1 || true
-    success "DNS caching enabled"
+    # ── DNS caching (reduces DNS latency in online games) ────────────────────
+    # nscd was removed from Fedora 41+. systemd-resolved ships by default and
+    # provides DNS caching out of the box — just ensure it is running.
+    task "Enabling DNS caching via systemd-resolved (lower ping jitter)"
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        success "systemd-resolved already running — DNS caching active"
+    else
+        systemctl enable --now systemd-resolved >> "$LOG_FILE" 2>&1 && \
+            success "systemd-resolved enabled — DNS caching active" || \
+            warn "Could not enable systemd-resolved — DNS caching unavailable"
+    fi
 
     # ── Quick-launch gaming mode helper ──────────────────────────────────────
     task "Installing 'game-mode' quick-launch wrapper"
