@@ -259,24 +259,43 @@ detect_hardware() {
     fi
 
     # ── GPU ───────────────────────────────────────────────────────────────────
+    # Uses `lspci -mm` (machine-readable) to match on exact PCI class strings:
+    #   "VGA compatible controller"  — class 0300, all display outputs
+    #   "3D controller"              — class 0302, headless compute GPUs (NVIDIA secondary)
+    #   "Display controller"         — class 0380, misc display hardware
+    # This avoids false-positives from AMD chipset USB/SATA controllers whose
+    # lspci description contains "AMD" AND accidentally matches "3d" as a
+    # substring of "USB 3.1" or "USB3" in the device name.
     task "Detecting GPU(s)"
-    if lspci 2>/dev/null | grep -iq "nvidia"; then
+    local lspci_display
+    lspci_display=$(lspci 2>/dev/null | grep -iE \
+        "VGA compatible controller|3D controller|Display controller")
+
+    if echo "$lspci_display" | grep -iq "nvidia"; then
         HW_GPU_NVIDIA=true
         local nvidia_model
-        nvidia_model=$(lspci 2>/dev/null | grep -i nvidia | head -1 | sed 's/.*: //')
+        nvidia_model=$(echo "$lspci_display" | grep -i nvidia | head -1 | sed 's/.*: //')
         success "NVIDIA GPU: $nvidia_model"
     fi
-    if lspci 2>/dev/null | grep -iE "amd|radeon|amdgpu" | grep -iE "vga|3d|display" &>/dev/null; then
+
+    # AMD GPU: must be a display-class device AND have an AMD/Radeon identifier.
+    # Explicitly exclude USB, SATA, Audio, and other non-GPU AMD PCI devices.
+    if echo "$lspci_display" | grep -iE "amd|radeon|amdgpu" &>/dev/null; then
         HW_GPU_AMD=true
         local amd_model
-        amd_model=$(lspci 2>/dev/null | grep -iE "amd|radeon" | grep -iE "vga|3d|display" | head -1 | sed 's/.*: //')
+        amd_model=$(echo "$lspci_display" | grep -iE "amd|radeon|amdgpu" | head -1 | sed 's/.*: //')
         success "AMD GPU: $amd_model"
     fi
-    if lspci 2>/dev/null | grep -i "intel" | grep -iE "vga|display" &>/dev/null; then
+
+    if echo "$lspci_display" | grep -i "intel" &>/dev/null; then
         HW_GPU_INTEL=true
-        success "Intel integrated GPU detected"
+        local intel_model
+        intel_model=$(echo "$lspci_display" | grep -i intel | head -1 | sed 's/.*: //')
+        success "Intel GPU: $intel_model"
     fi
-    $HW_GPU_NVIDIA || $HW_GPU_AMD || $HW_GPU_INTEL || warn "No recognised GPU detected — using generic framebuffer"
+
+    $HW_GPU_NVIDIA || $HW_GPU_AMD || $HW_GPU_INTEL || \
+        warn "No recognised GPU detected — using generic framebuffer"
 
     # ── USB Audio / Focusrite ─────────────────────────────────────────────────
     task "Detecting Focusrite / USB audio interfaces"
@@ -781,29 +800,23 @@ setup_media_production() {
 
     # ── Codecs ────────────────────────────────────────────────────────────────
     task "Installing multimedia codecs (all formats)"
-    # Core GStreamer plugin sets — use dnf_install so a missing plugin doesn't abort
     dnf_install gstreamer1-plugins-bad-free gstreamer1-plugins-bad-free-extras \
         gstreamer1-plugins-good gstreamer1-plugins-good-extras \
         gstreamer1-plugins-ugly
-    # libav / ffmpeg bridge
     dnf_install gstreamer1-plugin-libav
-    # ffmpeg-free (RPM Fusion Free) — provides libavcodec/libavformat as subpackages
     dnf_install ffmpeg-free
-    # Try standalone av libs (exist on some Fedora releases, merged into ffmpeg-free on others)
     dnf_install libavcodec-free libavformat-free 2>/dev/null || true
-    # Video codecs
     dnf_install x264 x265 libvpx
-    # OpenH264
     dnf_install openh264 gstreamer1-plugin-openh264 mozilla-openh264
     success "Codecs installed"
 
-    # ── DaVinci Resolve runtime dependencies (pre-installed, user downloads app)
+    # ── DaVinci Resolve runtime dependencies ─────────────────────────────────
     task "Installing DaVinci Resolve runtime dependencies"
     dnf_install libxcrypt-compat libGLU fuse fuse-libs
     echo
     echo -e "  ${CYAN}${ICO_INFO}  DaVinci Resolve dependency note:${RESET}"
-    echo -e "  ${GREY}     Runtime libs installed. To use DaVinci Resolve, download the${RESET}"
-    echo -e "  ${GREY}     installer from: https://www.blackmagicdesign.com/products/davinciresolve${RESET}"
+    echo -e "  ${GREY}     Runtime libs installed. Download from:${RESET}"
+    echo -e "  ${GREY}     https://www.blackmagicdesign.com/products/davinciresolve${RESET}"
     echo -e "  ${GREY}     Then run: sudo bash DaVinci_Resolve_*.run${RESET}"
     success "DaVinci Resolve runtime dependencies ready"
 
@@ -814,6 +827,152 @@ setup_media_production() {
         adobe-source-code-pro-fonts adobe-source-sans-pro-fonts \
         abattis-cantarell-fonts
     success "${ICO_FILM} Media codecs and libraries installed"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 7b : APPLICATIONS (Audio, Video, Image — all GUI apps)
+# ──────────────────────────────────────────────────────────────────────────────
+
+setup_applications() {
+    step_header "6" "${ICO_MUSIC} Audio, Video & Image Applications"
+
+    local real_user="${SUDO_USER:-$(logname 2>/dev/null || echo '')}"
+
+    # ── Audio production apps ─────────────────────────────────────────────────
+    task "Installing audio production applications"
+
+    # QJackCtl — JACK patchbay GUI (RPM, not Flatpak — needs direct JACK access)
+    dnf_install qjackctl
+    success "QJackCtl (JACK patchbay) installed"
+
+    # Carla — plugin host (VST2/VST3/LV2/LADSPA/CLAP)
+    dnf_install carla
+    success "Carla plugin host installed"
+
+    # Cadence — full JACK/audio session manager suite
+    dnf_install cadence 2>/dev/null || \
+        flatpak install -y flathub org.kxstudio.Cadence >> "$LOG_FILE" 2>&1 || \
+        warn "Cadence not available — use QJackCtl instead"
+
+    # Calf Studio plugins (LV2 suite)
+    dnf_install calf
+    success "Calf LV2 plugin suite installed"
+
+    # qsynth / FluidSynth (MIDI synthesiser)
+    dnf_install qsynth fluidsynth fluid-soundfont-gm
+    success "qsynth + FluidSynth MIDI synthesiser installed"
+
+    # Ardour — professional DAW (via Flatpak for latest stable)
+    task "Installing Ardour DAW"
+    flatpak install -y flathub org.ardour.Ardour >> "$LOG_FILE" 2>&1 && \
+        success "Ardour DAW installed" || \
+        warn "Ardour Flatpak failed — install from https://ardour.org/download.html"
+
+    # Audacity — audio editor / recorder
+    task "Installing Audacity"
+    flatpak install -y flathub org.audacityteam.Audacity >> "$LOG_FILE" 2>&1 && \
+        success "Audacity installed" || \
+        dnf_install audacity && success "Audacity (RPM) installed"
+
+    # LMMS — free DAW alternative
+    task "Installing LMMS"
+    flatpak install -y flathub io.lmms.LMMS >> "$LOG_FILE" 2>&1 && \
+        success "LMMS installed" || warn "LMMS Flatpak not available"
+
+    # Helvum — PipeWire patchbay GUI (modern replacement for qpwgraph)
+    dnf_install helvum 2>/dev/null || \
+        flatpak install -y flathub org.pipewire.Helvum >> "$LOG_FILE" 2>&1 || \
+        warn "Helvum not available — use qpwgraph instead"
+
+    # qpwgraph — PipeWire / JACK graph GUI
+    dnf_install qpwgraph 2>/dev/null || true
+
+    success "${ICO_MUSIC} Audio applications complete"
+
+    # ── Video production apps ─────────────────────────────────────────────────
+    task "Installing video production applications"
+
+    # Kdenlive — professional NLE video editor
+    task "Installing Kdenlive"
+    flatpak install -y flathub org.kde.kdenlive >> "$LOG_FILE" 2>&1 && \
+        success "Kdenlive video editor installed" || \
+        dnf_install kdenlive && success "Kdenlive (RPM) installed"
+
+    # OBS Studio — recording and streaming
+    task "Installing OBS Studio"
+    flatpak install -y flathub com.obsproject.Studio >> "$LOG_FILE" 2>&1 && \
+        success "OBS Studio installed" || \
+        dnf_install obs-studio && success "OBS Studio (RPM) installed"
+
+    # Blender — 3D / VFX / compositing
+    task "Installing Blender"
+    flatpak install -y flathub org.blender.Blender >> "$LOG_FILE" 2>&1 && \
+        success "Blender installed" || \
+        dnf_install blender && success "Blender (RPM) installed"
+
+    # Kdenlive / OBS OBS plugins
+    dnf_install obs-studio-plugin-webkitgtk 2>/dev/null || true
+
+    success "${ICO_FILM} Video applications complete"
+
+    # ── Image editing apps ────────────────────────────────────────────────────
+    task "Installing image editing applications"
+
+    # GIMP — photo / image editor
+    task "Installing GIMP"
+    flatpak install -y flathub org.gimp.GIMP >> "$LOG_FILE" 2>&1 && \
+        success "GIMP installed" || \
+        dnf_install gimp && success "GIMP (RPM) installed"
+
+    # Krita — digital painting
+    task "Installing Krita"
+    flatpak install -y flathub org.kde.krita >> "$LOG_FILE" 2>&1 && \
+        success "Krita installed" || \
+        dnf_install krita && success "Krita (RPM) installed"
+
+    # Inkscape — vector graphics
+    task "Installing Inkscape"
+    flatpak install -y flathub org.inkscape.Inkscape >> "$LOG_FILE" 2>&1 && \
+        success "Inkscape installed" || \
+        dnf_install inkscape && success "Inkscape (RPM) installed"
+
+    # RawTherapee — RAW photo processing
+    task "Installing RawTherapee"
+    flatpak install -y flathub com.rawtherapee.RawTherapee >> "$LOG_FILE" 2>&1 && \
+        success "RawTherapee installed" || \
+        dnf_install rawtherapee && success "RawTherapee (RPM) installed"
+
+    # darktable — RAW processing alternative
+    task "Installing darktable"
+    flatpak install -y flathub org.darktable.Darktable >> "$LOG_FILE" 2>&1 && \
+        success "darktable installed" || warn "darktable Flatpak not available"
+
+    success "${ICO_BRUSH} Image applications complete"
+
+    # ── Fix Flatpak XDG path so apps appear in launcher ──────────────────────
+    # When Flatpak is installed as root the exports path may not be in XDG_DATA_DIRS.
+    # Add it globally so every user's app launcher sees Flatpak apps.
+    task "Ensuring Flatpak apps appear in app launcher"
+    local flatpak_exports="/var/lib/flatpak/exports/share"
+    if [[ -d "$flatpak_exports" ]]; then
+        cat > /etc/profile.d/flatpak-xdg.sh << 'EOF'
+# NovаStudio OS — Ensure system Flatpak apps appear in app launchers
+if [[ -d /var/lib/flatpak/exports/share ]]; then
+    export XDG_DATA_DIRS="/var/lib/flatpak/exports/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+fi
+if [[ -d "$HOME/.local/share/flatpak/exports/share" ]]; then
+    export XDG_DATA_DIRS="$HOME/.local/share/flatpak/exports/share:${XDG_DATA_DIRS}"
+fi
+EOF
+        chmod +x /etc/profile.d/flatpak-xdg.sh
+        success "Flatpak XDG_DATA_DIRS configured — apps will appear after next login"
+    fi
+
+    # Also update desktop database right now for the current session
+    update-desktop-database /var/lib/flatpak/exports/share/applications \
+        >> "$LOG_FILE" 2>&1 || true
+
+    success "${ICO_STAR} All applications installed"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1098,9 +1257,30 @@ setup_productivity_tools() {
     task "Installing VS Code (Flatpak)"
     flatpak install -y flathub com.visualstudio.code >> "$LOG_FILE" 2>&1 || true
 
-    task "Installing web browser (Firefox + Chromium)"
-    dnf_install firefox
-    flatpak install -y flathub org.chromium.Chromium >> "$LOG_FILE" 2>&1 || true
+    task "Installing Brave browser"
+    # Try native RPM first (better performance, system integration)
+    if ! rpm -q brave-browser &>/dev/null; then
+        if dnf config-manager addrepo \
+            --from-repofile=https://brave-keyring.s3.brave.com/brave-browser.repo \
+            >> "$LOG_FILE" 2>&1; then
+            dnf_install brave-browser
+            success "Brave browser (native RPM) installed"
+        else
+            # Fallback: Flatpak
+            flatpak install -y flathub com.brave.Browser >> "$LOG_FILE" 2>&1 && \
+                success "Brave browser (Flatpak) installed" || \
+                warn "Brave install failed — visit https://brave.com/linux to install manually"
+        fi
+    else
+        success "Brave browser already installed"
+    fi
+    # Remove Firefox and Chromium if present — keep only Brave
+    if rpm -q firefox &>/dev/null; then
+        dnf remove -y firefox >> "$LOG_FILE" 2>&1 && \
+            info "Firefox removed (replaced by Brave)" || true
+    fi
+    flatpak uninstall -y org.mozilla.firefox >> "$LOG_FILE" 2>&1 || true
+    flatpak uninstall -y org.chromium.Chromium >> "$LOG_FILE" 2>&1 || true
 
     task "Installing communication apps"
     flatpak install -y flathub \
@@ -1153,7 +1333,8 @@ echo -e "     ${W}game-launch <exe>${R}              Launch with GameMode + Mang
 echo -e "     ${W}gamemoderun mangohud %command%${R} Steam launch options template"
 echo -e "     ${W}gamescope -W 1920 -H 1080 -- %command%${R}  Force resolution\n"
 
-echo -e "  ${G}⚙️  System${R}"
+echo -e "  ${G}🌐 Browser${R}"
+echo -e "     ${W}brave-browser${R}                  Brave (only browser installed)\n"
 echo -e "     ${W}btop${R}                           System monitor"
 echo -e "     ${W}novastudio-info${R}                This help screen"
 echo -e "     ${W}sudo novastudio-setup.sh${R}       Re-run setup\n"
@@ -1752,14 +1933,12 @@ EOF
     echo -e "  ${LGREEN}║${RESET}  ${CYAN}What was installed:${RESET}                                         ${LGREEN}║${RESET}"
     echo -e "  ${LGREEN}║${RESET}   ${GREY}• Low-latency kernel + RT tuning          ${LGREEN}║${RESET}"
     echo -e "  ${LGREEN}║${RESET}   ${GREY}• PipeWire + JACK + Focusrite support      ${LGREEN}║${RESET}"
-    echo -e "  ${LGREEN}║${RESET}   ${GREY}• Wine Staging + yabridge (Windows VSTs)   ${LGREEN}║${RESET}"
-    echo -e "  ${LGREEN}║${RESET}   ${GREY}• Media tools: Kdenlive, OBS, Blender      ${LGREEN}║${RESET}"
-    echo -e "  ${LGREEN}║${RESET}   ${GREY}• Audio: Ardour, Audacity, Carla, Calf     ${LGREEN}║${RESET}"
+    echo -e "  ${LGREEN}║${RESET}   ${GREY}• QJackCtl, Carla, Ardour, Audacity, LMMS  ${LGREEN}║${RESET}"
+    echo -e "  ${LGREEN}║${RESET}   ${GREY}• Kdenlive, OBS Studio, Blender            ${LGREEN}║${RESET}"
     echo -e "  ${LGREEN}║${RESET}   ${GREY}• GIMP, Krita, Inkscape, RawTherapee       ${LGREEN}║${RESET}"
+    echo -e "  ${LGREEN}║${RESET}   ${GREY}• Wine + yabridge (Windows VSTs)           ${LGREEN}║${RESET}"
     echo -e "  ${LGREEN}║${RESET}   ${GREY}• Gaming: Steam, Lutris, GameMode, MangoHud${LGREEN}║${RESET}"
-    echo -e "  ${LGREEN}║${RESET}   ${GREY}• DXVK + VKD3D-Proton (DX9–DX12 → Vulkan) ${LGREEN}║${RESET}"
-    echo -e "  ${LGREEN}║${RESET}   ${GREY}• Controllers: Xbox (xpadneo) + DualSense  ${LGREEN}║${RESET}"
-    echo -e "  ${LGREEN}║${RESET}   ${GREY}• Emulation: RetroArch, Dolphin, RPCS3     ${LGREEN}║${RESET}"
+    echo -e "  ${LGREEN}║${RESET}   ${GREY}• Brave browser (only browser installed)   ${LGREEN}║${RESET}"
     $HW_GPU_NVIDIA && echo -e "  ${LGREEN}║${RESET}   ${GREY}• NVIDIA drivers (akmod-nvidia)            ${LGREEN}║${RESET}"
     $HW_GPU_AMD    && echo -e "  ${LGREEN}║${RESET}   ${GREY}• AMD amdgpu + ROCm + ACO compiler         ${LGREEN}║${RESET}"
     echo -e "  ${LGREEN}║${RESET}   ${GREY}• Theme switcher + Papirus icons           ${LGREEN}║${RESET}"
@@ -1810,12 +1989,13 @@ interactive_menu() {
     echo -e "  ${GREY}  [2]  Low-latency / realtime kernel + system tuning${RESET}"
     echo -e "  ${GREY}  [3]  GPU drivers (NVIDIA / AMD / Intel — auto-detected)${RESET}"
     echo -e "  ${GREY}  [4]  PipeWire audio + JACK + Focusrite Scarlett/Clarett${RESET}"
-    echo -e "  ${GREY}  [5]  Media production: Kdenlive, OBS, Blender, GIMP, Krita${RESET}"
-    echo -e "  ${GREY}  [6]  Wine Staging + yabridge + Bottles (Windows VST support)${RESET}"
-    echo -e "  ${GREY}  [7]  Desktop themes + Papirus icons + theme switcher${RESET}"
-    echo -e "  ${GREY}  [8]  Developer tools + productivity apps${RESET}"
-    echo -e "  ${GREY}  [9]  Security hardening (firewall + auto-updates)${RESET}"
-    echo -e "  ${GREY}  [10] ${ICO_GAME} Gaming: Steam, Lutris, GameMode, MangoHud, controllers${RESET}"
+    echo -e "  ${GREY}  [5]  Media codecs + fonts${RESET}"
+    echo -e "  ${GREY}  [6]  ${ICO_MUSIC} Apps: Ardour, QJackCtl, Carla, Kdenlive, OBS, Blender, GIMP, Krita${RESET}"
+    echo -e "  ${GREY}  [7]  Wine Staging + yabridge + Bottles (Windows VST support)${RESET}"
+    echo -e "  ${GREY}  [8]  Desktop themes + Papirus icons + theme switcher${RESET}"
+    echo -e "  ${GREY}  [9]  Developer tools + Brave browser${RESET}"
+    echo -e "  ${GREY}  [10] Security hardening (firewall + auto-updates)${RESET}"
+    echo -e "  ${GREY}  [11] ${ICO_GAME} Gaming: Steam, Lutris, GameMode, MangoHud, controllers${RESET}"
     echo
 
     if ! confirm "Begin NovаStudio OS installation?" "y"; then
@@ -1832,18 +2012,19 @@ interactive_menu() {
     read -r mode_choice
     mode_choice="${mode_choice:-F}"
 
-    local do_gpu=true do_audio=true do_media=true do_wine=true
+    local do_gpu=true do_audio=true do_media=true do_apps=true do_wine=true
     local do_themes=true do_productivity=true do_security=true do_gaming=true
 
     if [[ "$mode_choice" =~ ^[Cc] ]]; then
         echo
-        confirm "Install GPU drivers?"            "y" || do_gpu=false
-        confirm "Setup audio (PipeWire/JACK/Focusrite)?" "y" || do_audio=false
-        confirm "Install media production tools?" "y" || do_media=false
-        confirm "Setup Wine + yabridge?"          "y" || do_wine=false
-        confirm "Configure desktop themes?"       "y" || do_themes=false
-        confirm "Install productivity tools?"     "y" || do_productivity=false
-        confirm "Apply security hardening?"       "y" || do_security=false
+        confirm "Install GPU drivers?"                          "y" || do_gpu=false
+        confirm "Setup audio (PipeWire/JACK/Focusrite)?"        "y" || do_audio=false
+        confirm "Install media codecs + fonts?"                 "y" || do_media=false
+        confirm "Install audio/video/image apps (Ardour etc.)?" "y" || do_apps=false
+        confirm "Setup Wine + yabridge?"                        "y" || do_wine=false
+        confirm "Configure desktop themes?"                     "y" || do_themes=false
+        confirm "Install productivity tools + Brave?"           "y" || do_productivity=false
+        confirm "Apply security hardening?"                     "y" || do_security=false
         confirm "Setup gaming (Steam/Lutris/GameMode/controllers)?" "y" || do_gaming=false
     fi
 
@@ -1858,6 +2039,7 @@ interactive_menu() {
     $do_gpu          && install_gpu_drivers
     $do_audio        && setup_audio
     $do_media        && setup_media_production
+    $do_apps         && setup_applications
     $do_wine         && setup_windows_compatibility
     $do_themes       && setup_desktop_themes
     $do_productivity && setup_productivity_tools
@@ -1881,13 +2063,15 @@ case "${1:-}" in
         print_banner
         preflight_checks; detect_hardware; optimise_system
         install_gpu_drivers; setup_audio; setup_media_production
-        setup_windows_compatibility; setup_desktop_themes
+        setup_applications; setup_windows_compatibility; setup_desktop_themes
         setup_productivity_tools; setup_security; setup_gaming; final_setup
         ;;
     --detect)
         require_root; print_banner; detect_hardware ;;
     --audio-only)
         require_root; print_banner; setup_audio ;;
+    --apps-only)
+        require_root; print_banner; setup_applications ;;
     --wine-only)
         require_root; print_banner; setup_windows_compatibility ;;
     --themes-only)
@@ -1902,6 +2086,7 @@ case "${1:-}" in
         echo -e "  ${GREY}  --full          Full unattended install${RESET}"
         echo -e "  ${GREY}  --detect        Hardware detection only${RESET}"
         echo -e "  ${GREY}  --audio-only    Audio subsystem only${RESET}"
+        echo -e "  ${GREY}  --apps-only     GUI applications only${RESET}"
         echo -e "  ${GREY}  --wine-only     Wine + yabridge only${RESET}"
         echo -e "  ${GREY}  --themes-only   Desktop themes only${RESET}"
         echo -e "  ${GREY}  --gaming-only   Gaming stack only${RESET}"
