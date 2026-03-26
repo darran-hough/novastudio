@@ -6,7 +6,7 @@ A modular Bash installer for Fedora that configures a purpose-built creative wor
 
 ## Requirements
 
-- **OS:** Fedora 38 or later (tested up to Fedora 43)
+- **OS:** Fedora 42 or later (tested up to Fedora 43)
 - **Privileges:** Must be run with `sudo`
 - **Internet:** Active connection required for package downloads
 
