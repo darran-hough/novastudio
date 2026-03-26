@@ -42,9 +42,9 @@ log "Installing audio production stack"
 context.properties = {
     default.clock.rate          = 48000
     default.clock.allowed-rates = [ 44100 48000 88200 96000 176400 192000 ]
-    default.clock.quantum       = 32
-    default.clock.min-quantum   = 16
-    default.clock.max-quantum   = 8192
+    default.clock.quantum       = 256
+    default.clock.min-quantum   = 64
+    default.clock.max-quantum   = 2048
     core.daemon                 = true
     core.name                   = pipewire-0
     mem.allow-mlock             = true
@@ -64,7 +64,7 @@ monitor.alsa.rules = [
         matches = [ { node.name = "~alsa_*" } ]
         actions = {
             update-props = {
-                api.alsa.period-size   = 32
+                api.alsa.period-size   = 128
                 api.alsa.headroom      = 0
                 api.alsa.disable-mmap  = false
                 session.suspend-timeout-seconds = 0
