@@ -3,6 +3,16 @@
 
 LOG="/var/log/novastudio-installer.log"
 
+
+ICO_AUDIO="🎧";
+AUDIO_INTERFACE="🎧";
+
+skip()    { echo -e "[SKIP]  $* — already installed."; }
+
+ERRORS=()
+INSTALLED=()
+SKIPPED=()
+
 log(){
  echo "[ $(date '+%F %T') ] $*" | tee -a "$LOG"
 }
@@ -40,13 +50,21 @@ cat << "EOF"
 EOF
 }
 
-install_pkg(){
- for pkg in "$@"; do
-   if ! rpm -q "$pkg" &>/dev/null; then
-      log "Installing $pkg"
-      dnf install -y --allowerasing "$pkg"
-   fi
- done
+install_pkg() {
+    for pkg in "$@"; do
+        if rpm -q "$pkg" &>/dev/null; then
+            skip "$pkg"
+            SKIPPED+=("$pkg")
+        else
+            log "Installing $pkg"
+            if dnf install -y --allowerasing "$pkg"; then
+                INSTALLED+=("$pkg")
+            else
+                log "$pkg — install failed."
+                ERRORS+=("$pkg: dnf install failed")
+            fi
+        fi
+    done
 }
 
 load_modules(){
@@ -72,3 +90,7 @@ run_modules(){
    "module_$m"
  done
 }
+
+
+
+
